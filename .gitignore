@@ -1,0 +1,26 @@
+# Gradle
+.gradle/
+build/
+**/build/
+local.properties
+gradle-wrapper.jar
+
+# IDE
+.idea/
+*.iml
+*.iws
+*.ipr
+.DS_Store
+
+# Android
+*.apk
+*.aab
+*.ap_
+*.dex
+
+# Keys / secrets
+*.keystore
+*.jks
+*.p12
+local.properties
+secrets.properties
