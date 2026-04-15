@@ -18,18 +18,23 @@ The official Android/JVM SDK for the [Mobile AI Gateway](https://app.maig.dev) �
 
 ## Installation
 
-### Gradle (Maven Central — coming soon)
+### Gradle (JitPack)
 
 ```kotlin
-// build.gradle.kts
+// In your project-level build.gradle.kts
+repositories {
+    maven { url = uri("https://jitpack.io") }
+}
+
+// In your app-level build.gradle.kts
 dependencies {
-    implementation("com.maig:sdk:0.1.0")
+    implementation("com.github.maig-dev:maig-android-sdk:0.1.0")
 }
 ```
 
 ### Local build
 
-Until the library is published to Maven Central, build and publish it to your local Maven repository:
+To build and publish to your local Maven repository instead:
 
 ```bash
 git clone https://github.com/your-org/maig-android-sdk.git
@@ -37,7 +42,7 @@ cd maig-android-sdk
 ./gradlew :sdk:publishToMavenLocal
 ```
 
-Then add `mavenLocal()` to your project's repository list and the dependency above.
+Then add `mavenLocal()` to your project's repository list and reference `com.github.maig-dev:maig-android-sdk:0.1.0` as the dependency.
 
 ## Quick Start
 
@@ -89,6 +94,59 @@ class ChatViewModel : ViewModel() {
     }
 }
 ```
+
+## Prompt Management
+
+`PromptStore` lets you define prompts on the server in your MAIG dashboard and deliver them to your app without a new release. At app startup, call `sync()` once to pull any changed prompts into a local cache. Every subsequent call to `getPrompt()` reads directly from that cache — no network call at inference time.
+
+Prompts are defined and managed at [docs.maig.dev/prompt-management](https://docs.maig.dev/prompt-management).
+
+### Initialization
+
+```kotlin
+val store = PromptStore(apiKey = "maig_your_key", context = applicationContext)
+```
+
+### Sync at startup
+
+`sync()` is a suspend function. Call it once from a coroutine early in your app lifecycle — for example in `Application.onCreate()` or a `ViewModel` init block:
+
+```kotlin
+viewModelScope.launch {
+    try {
+        store.sync()
+    } catch (e: AIGatewayError.AuthFailure) {
+        // handle bad key
+    } catch (e: AIGatewayError.NetworkError) {
+        // handle connectivity issues — cached prompts still available
+    }
+}
+```
+
+Only prompts whose content has changed since the last sync are transmitted, so the request is lightweight on subsequent launches.
+
+### Retrieving a prompt
+
+```kotlin
+// Returns List<Message>?, or null if the prompt hasn't been synced yet
+val messages = store.getPrompt("welcome") ?: emptyList()
+```
+
+### Variable substitution
+
+Prompts can contain `{{VARIABLE}}` placeholders defined on the server. Supply values at retrieval time:
+
+```kotlin
+val result = store.getPrompt("support", mapOf("userName" to "Alice"))
+    ?: return
+
+// result.messages — List<Message> with {{userName}} replaced by "Alice"
+// result.missingVariables — placeholders in the template not supplied in the map
+// result.extraVariables — map keys that did not correspond to any placeholder
+val messages = result.messages
+```
+
+Use `missingVariables` and `extraVariables` during development to catch template/call-site mismatches early.
 
 ## Configuration
 

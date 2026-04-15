@@ -1,5 +1,6 @@
 plugins {
     alias(libs.plugins.kotlin.jvm)
+    `maven-publish`
 }
 
 group = "com.maig"
@@ -27,4 +28,15 @@ tasks.test {
 tasks.register<Jar>("sourcesJar") {
     archiveClassifier.set("sources")
     from(sourceSets.main.get().allSource)
+}
+
+publishing {
+    publications {
+        create<MavenPublication>("release") {
+            from(components["java"])
+            groupId = "com.github.maig-dev"
+            artifactId = "maig-android-sdk"
+            version = "0.1.0"
+        }
+    }
 }
