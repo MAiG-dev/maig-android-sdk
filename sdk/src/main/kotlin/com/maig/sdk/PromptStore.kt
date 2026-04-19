@@ -36,29 +36,46 @@ data class PromptResult(
  * to fetch any changed prompts, then use [getPrompt] at inference time to retrieve
  * the cached messages — no network call required.
  *
+ * ## Versioning
+ *
+ * Prompts use semantic versioning (major.minor). A **major bump** (e.g. v1.0 → v2.0)
+ * means a new `{{VARIABLE}}` was added — your app code must handle it. A **minor bump**
+ * (e.g. v1.0 → v1.1) is a safe content update with no new variables.
+ *
+ * ## Version pinning
+ *
+ * Pin a prompt to a major version so the SDK only ever receives minor updates within
+ * that major. The SDK will never download a version beyond the pinned major until you
+ * explicitly update the pin — protecting your app from breaking changes until you are
+ * ready to handle the new variable.
+ *
+ * ```kotlin
+ * // Pin via JSON config file (maig-prompts.json in your assets folder):
+ * // { "pinned": { "support-bot": 1, "onboarding": 2 } }
+ * val store = PromptStore(apiKey = "maig_...", context = applicationContext,
+ *                         configFile = "maig-prompts.json")
+ *
+ * // Or pin at runtime (overrides the JSON file):
+ * store.pin("support-bot", majorVersion = 1)
+ * ```
+ *
  * Prompt names are immutable after creation on the server. Renaming a prompt
  * is a delete + create operation; clients receive the deletion on next sync.
  *
- * ```kotlin
- * val store = PromptStore(apiKey = "maig_...", context = applicationContext)
- *
- * // At app launch (in a coroutine)
- * store.sync()
- *
- * // At inference time
- * val storedMessages = store.getPrompt("support-bot-system") ?: emptyList()
- * val messages = storedMessages + Message(role = "user", content = "Hi")
- * val result = client.generateText(messages = messages)
- * ```
- *
- * @param apiKey  Your project API key (starts with `maig_`).
- * @param context Android [Context] used to resolve the internal files directory.
- * @param baseUrl Override the default gateway URL — useful for testing.
+ * @param apiKey     Your project API key (starts with `maig_`).
+ * @param context    Android [Context] used to resolve the internal files directory.
+ * @param baseUrl    Override the default gateway URL — useful for testing.
+ * @param configFile Asset filename for pinned version config. Defaults to `"maig-prompts.json"`,
+ *                   so the SDK automatically loads that file from your `assets/` folder if it
+ *                   exists. Pass `null` to disable config file loading entirely.
+ *                   Format: `{ "pinned": { "my-prompt": 1 } }`.
+ *                   Runtime [pin] calls override values from this file.
  */
 class PromptStore @JvmOverloads constructor(
     private val apiKey: String,
     private val context: Context,
     private val baseUrl: String = DEFAULT_BASE_URL,
+    private val configFile: String? = DEFAULT_CONFIG_FILE,
 ) {
     private val gson = Gson()
     private val okHttpClient = OkHttpClient.Builder()
@@ -69,9 +86,10 @@ class PromptStore @JvmOverloads constructor(
     /** In-memory cache: prompt name → [CachedPromptSet] */
     private var cache: MutableMap<String, CachedPromptSet> = mutableMapOf()
 
+    /** Pinned major versions: prompt name → major version number */
+    private val pinnedMajors: MutableMap<String, Int> = mutableMapOf()
+
     private val cacheFile: File by lazy {
-        // Derive an opaque filename from a simple hash of the API key so the
-        // file name does not leak the key value.
         var hash = -3750763034362895579L
         for (c in apiKey) {
             hash = hash xor c.code.toLong()
@@ -82,26 +100,48 @@ class PromptStore @JvmOverloads constructor(
     }
 
     init {
-        // Load persisted cache synchronously so getPrompt() works immediately.
         loadCacheFromDisk()
+        loadConfigFromAssets()
     }
 
     // ── Public API ────────────────────────────────────────────────────────────
 
     /**
+     * Pins a prompt to a major version so the SDK only receives minor updates within
+     * that major. Call this before [sync] for the pin to take effect on the next sync.
+     *
+     * A major version bump (e.g. v1 → v2) indicates a new `{{VARIABLE}}` was added.
+     * Pinning to v1 ensures your app never receives v2+ content until you are ready
+     * to update your code to handle the new variable and bump the pin to 2.
+     *
+     * Runtime pins override values loaded from the JSON config file.
+     *
+     * @param name         The prompt name to pin.
+     * @param majorVersion The major version to pin to (e.g. `1` for all v1.x updates).
+     */
+    fun pin(name: String, majorVersion: Int) {
+        pinnedMajors[name] = majorVersion
+    }
+
+    /**
      * Fetches changed prompts from the server and updates the local cache.
      *
-     * Safe to call at app launch or whenever a refresh is desired.
      * Only prompts whose content has changed since the last sync are transmitted.
+     * Pinned prompts are only updated within their pinned major version.
+     *
+     * Safe to call at app launch or whenever a refresh is desired.
      *
      * @throws AIGatewayError on authentication failure, server error, or network error.
      */
     suspend fun sync() = withContext(Dispatchers.IO) {
-        val bodyMap: Map<String, Any> = if (cache.isEmpty()) {
-            emptyMap()
-        } else {
-            mapOf("hashes" to cache.mapValues { it.value.contentHash })
+        val bodyMap = mutableMapOf<String, Any>()
+        if (cache.isNotEmpty()) {
+            bodyMap["hashes"] = cache.mapValues { it.value.contentHash }
         }
+        if (pinnedMajors.isNotEmpty()) {
+            bodyMap["pinned"] = pinnedMajors.toMap()
+        }
+
         val json = gson.toJson(bodyMap)
         val body = json.toRequestBody("application/json".toMediaType())
 
@@ -113,11 +153,11 @@ class PromptStore @JvmOverloads constructor(
 
         val responseBody = try {
             okHttpClient.newCall(request).execute().use { response ->
-                val body = response.body?.string().orEmpty()
+                val responseText = response.body?.string().orEmpty()
                 when {
                     response.code == 401 -> throw AIGatewayError.AuthFailure()
-                    !response.isSuccessful -> throw AIGatewayError.ServerError(response.code, body.takeIf { it.isNotBlank() })
-                    else -> body
+                    !response.isSuccessful -> throw AIGatewayError.ServerError(response.code, responseText.takeIf { it.isNotBlank() })
+                    else -> responseText
                 }
             }
         } catch (e: AIGatewayError) {
@@ -128,17 +168,16 @@ class PromptStore @JvmOverloads constructor(
 
         val syncResponse = gson.fromJson(responseBody, SyncResponse::class.java)
 
-        // Merge returned prompts (upsert by name).
         for (payload in syncResponse.prompts) {
             cache[payload.name] = CachedPromptSet(
                 name = payload.name,
-                version = payload.version,
+                majorVersion = payload.majorVersion,
+                minorVersion = payload.minorVersion,
                 contentHash = payload.contentHash,
                 messages = payload.messages,
             )
         }
 
-        // Remove deleted prompts.
         for (name in syncResponse.deletedNames) {
             cache.remove(name)
         }
@@ -196,15 +235,31 @@ class PromptStore @JvmOverloads constructor(
         try {
             val json = cacheFile.readText()
             val type = object : TypeToken<MutableMap<String, CachedPromptSet>>() {}.type
-            cache = gson.fromJson(json, type) ?: mutableMapOf()
+            val loaded: MutableMap<String, CachedPromptSet>? = gson.fromJson(json, type)
+            // Migrate legacy entries that have `version` but no `majorVersion`.
+            cache = loaded?.mapValues { (_, v) ->
+                if (v.majorVersion == 0 && v.legacyVersion != null) {
+                    v.copy(majorVersion = v.legacyVersion, minorVersion = 0)
+                } else v
+            }?.toMutableMap() ?: mutableMapOf()
         } catch (_: Exception) {
             // Corrupted cache — start fresh on next sync.
         }
     }
 
+    private fun loadConfigFromAssets() {
+        val file = configFile ?: return
+        try {
+            val json = context.assets.open(file).bufferedReader().use { it.readText() }
+            val config = gson.fromJson(json, PromptsConfig::class.java)
+            config?.pinned?.forEach { (name, major) -> pinnedMajors.putIfAbsent(name, major) }
+        } catch (_: Exception) {
+            // Config file not found or malformed — pinning relies on runtime calls only.
+        }
+    }
+
     private fun persistCacheToDisk() {
         val json = gson.toJson(cache)
-        // Atomic write: write to a temp file, then rename.
         val tmp = File(cacheFile.parent, ".${cacheFile.name}.tmp")
         tmp.writeText(json)
         tmp.renameTo(cacheFile)
@@ -214,7 +269,10 @@ class PromptStore @JvmOverloads constructor(
 
     private data class CachedPromptSet(
         val name: String,
-        val version: Int,
+        @SerializedName("majorVersion") val majorVersion: Int = 1,
+        @SerializedName("minorVersion") val minorVersion: Int = 0,
+        /** Legacy field — only present in caches written before semver. */
+        @SerializedName("version") val legacyVersion: Int? = null,
         @SerializedName("contentHash") val contentHash: String,
         val messages: List<Message>,
     )
@@ -226,12 +284,18 @@ class PromptStore @JvmOverloads constructor(
 
     private data class PromptPayload(
         val name: String,
-        val version: Int,
+        val majorVersion: Int,
+        val minorVersion: Int,
         val contentHash: String,
         val messages: List<Message>,
     )
 
+    private data class PromptsConfig(
+        val pinned: Map<String, Int>?,
+    )
+
     private companion object {
         const val DEFAULT_BASE_URL = "https://api.maig.dev"
+        const val DEFAULT_CONFIG_FILE = "maig-prompts.json"
     }
 }
